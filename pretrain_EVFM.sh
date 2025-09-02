@@ -1,0 +1,15 @@
+torchrun --nproc_per_node=1 main_pretrain.py \
+--batch_size 8 --accum_iter 4 --blr 0.0001 \
+--epochs 50 --warmup_epochs 20 --num_workers 16 \
+--model emae_vit_large_patch16 \
+--input_size 96 --patch_size 8 \
+--mask_ratio 0.75 \
+--model_type EVFM \
+--dataset_type sentinel --dropped_bands 0 9 10 \
+--grouped_bands 0 1 2 6 --grouped_bands 3 4 5 7 --grouped_bands 8 9 \
+--train_path ./dataset/fmow-sentinel/train_updated.csv \
+--output_dir ./experiments/EVFM_multispectral \
+--log_dir ./experiments/EVFM_multispectral \
+--fusion_weight \
+--use_ori_img \
+--norm_pix_loss

@@ -27,10 +27,7 @@ from util.datasets import build_fmow_dataset
 from util.misc import NativeScalerWithGradNormCount as NativeScaler
 
 import models_mae
-import models_mae_group_channels
-import models_mae_temporal
-import models_crossmae_group_channels
-import models_multimae_group_channels
+import models_EVFM
 
 from engine_pretrain import train_one_epoch, train_one_epoch_temporal
 
@@ -44,7 +41,7 @@ def get_args_parser():
                         help='Accumulate gradient iterations (for increasing the effective batch size under memory constraints)')
 
     # Model parameters
-    parser.add_argument('--model_type', default=None, choices=['group_c', 'temporal', 'vanilla', 'group_cross', 'group_multi'],
+    parser.add_argument('--model_type', default=None, choices=['vanilla', 'EVFM'],
                         help='Use channel model')
     parser.add_argument('--model', default='mae_vit_large_patch16', type=str, metavar='MODEL',
                         help='Name of model to train')
@@ -109,12 +106,12 @@ def get_args_parser():
     parser.add_argument('--no_pin_mem', action='store_false', dest='pin_mem')
     parser.set_defaults(pin_mem=True)
 
-    # cross-MAE
-    parser.add_argument('--weight_fm', action='store_true', default=False,
-                        help='Weight the feature maps for decoder when running cross-mae')
-    parser.add_argument('--use_fm', nargs='+', type=int, default=[-1], 
+    # efficient-MAE
+    parser.add_argument('--fusion_weight', action='store_true', default=False,
+                        help='Weight the feature maps for decoder when running efficient-mae')
+    parser.add_argument('--use_encoder_feature', nargs='+', type=int, default=[-1], 
                         help='Feature maps to use for decoder')
-    parser.add_argument('--use_input', action='store_true', default=False,
+    parser.add_argument('--use_ori_img', action='store_true', default=False,
                         help="use input as a feature map")
     parser.add_argument('--self_attn', action='store_true', default=False, help="use self attention in decoder")
 
@@ -172,53 +169,22 @@ def main(args):
     )
 
     # define the model
-    if args.model_type == 'group_c':
+    if args.model_type == 'EVFM':
         # Workaround because action append will add to default list
         if len(args.grouped_bands) == 0:
             args.grouped_bands = [[0, 1, 2, 6], [3, 4, 5, 7], [8, 9]]
         print(f"Grouping bands {args.grouped_bands}")
-        model = models_mae_group_channels.__dict__[args.model](img_size=args.input_size,
-                                                               patch_size=args.patch_size,
-                                                               in_chans=dataset_train.in_c,
-                                                               channel_groups=args.grouped_bands,
-                                                               spatial_mask=args.spatial_mask,
-                                                               norm_pix_loss=args.norm_pix_loss)
-
-    elif args.model_type == 'group_cross':
-        # Workaround because action append will add to default list
-        if len(args.grouped_bands) == 0:
-            args.grouped_bands = [[0, 1, 2, 6], [3, 4, 5, 7], [8, 9]]
-        print(f"Grouping bands {args.grouped_bands}")
-        model = models_crossmae_group_channels.__dict__[args.model](img_size=args.input_size,
+        model = models_EVFM.__dict__[args.model](img_size=args.input_size,
                                                                patch_size=args.patch_size,
                                                                in_chans=dataset_train.in_c,
                                                                channel_groups=args.grouped_bands,
                                                                spatial_mask=args.spatial_mask,
                                                                norm_pix_loss=args.norm_pix_loss,
-                                                               use_fm=args.use_fm,
-                                                               use_input=args.use_input,
+                                                               use_encoder_feature=args.use_encoder_feature,
+                                                               use_ori_img=args.use_ori_img,
                                                                self_attn=args.self_attn,
-                                                               weight_fm=args.weight_fm)
+                                                               fusion_weight=args.fusion_weight)
 
-    elif args.model_type == 'group_multi':
-        # Workaround because action append will add to default list
-        if len(args.grouped_bands) == 0:
-            args.grouped_bands = [[0, 1, 2, 6], [3, 4, 5, 7], [8, 9]]
-        print(f"Grouping bands {args.grouped_bands}")
-        model = models_multimae_group_channels.__dict__[args.model](img_size=args.input_size,
-                                                               patch_size=args.patch_size,
-                                                               in_chans=dataset_train.in_c,
-                                                               channel_groups=args.grouped_bands,
-                                                               spatial_mask=args.spatial_mask,
-                                                               norm_pix_loss=args.norm_pix_loss,
-                                                               use_fm=args.use_fm,
-                                                               use_input=args.use_input,
-                                                               self_attn=args.self_attn,
-                                                               weight_fm=args.weight_fm)
-
-    elif args.model_type == 'temporal':
-        model = models_mae_temporal.__dict__[args.model](norm_pix_loss=args.norm_pix_loss)
-    # non-spatial, non-temporal
     else:
         model = models_mae.__dict__[args.model](img_size=args.input_size,
                                                 patch_size=args.patch_size,
@@ -264,20 +230,12 @@ def main(args):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
 
-        if args.model_type == 'temporal':
-            train_stats = train_one_epoch_temporal(
-                model, data_loader_train,
-                optimizer, device, epoch, loss_scaler,
-                log_writer=log_writer,
-                args=args
-            )
-        else:
-            train_stats = train_one_epoch(
-                model, data_loader_train,
-                optimizer, device, epoch, loss_scaler,
-                log_writer=log_writer,
-                args=args
-            )
+        train_stats = train_one_epoch(
+            model, data_loader_train,
+            optimizer, device, epoch, loss_scaler,
+            log_writer=log_writer,
+            args=args
+        )
 
         if args.output_dir and (epoch % 5 == 0 or epoch + 1 == args.epochs):
             misc.save_model(
