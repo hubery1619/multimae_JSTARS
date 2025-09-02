@@ -1,0 +1,12 @@
+python main_finetune.py \
+--batch_size 16 --accum_iter 16 --blr 0.0002 \
+--epochs 1 --num_workers 2 \
+--input_size 96 --patch_size 8  \
+--weight_decay 0.05 --drop_path 0.2 --reprob 0.25 --mixup 0.8 --cutmix 1.0 \
+--dataset_type sentinel --dropped_bands 0 9 10 \
+--train_path ./dataset/fmow-sentinel/train_updated.csv \
+--test_path ./dataset/fmow-sentinel/val_updated.csv \
+--output_dir ./experiments/finetune \
+--log_dir ./experiments/finetune \
+--model_type vanilla \
+--finetune ./checkpoint/checkpoint-49.pth 

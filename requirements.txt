@@ -1,0 +1,17 @@
+# conda create -n multimae python=3.8
+# conda install pytorch==2.0.0 torchvision==0.15.0 torchaudio==2.0.0 pytorch-cuda=11.7 -c pytorch -c nvidia
+timm==0.3.2
+rasterio
+wandb
+# pip install tensorboard
+# pip install --upgrade torch torchvision
+# pip3 install --upgrade pip
+# pip3 install packaging
+
+### modify /software/Anaconda/Anaconda3_install/envs/multimae/lib/python3.8/site-packages/timm/models/layers/helpers.py
+# from itertools import repeat
+# from torch._six import container_abcs
+
+# pip install pandas 
+
+# deactivate the numpy to 1.20.1     pandas 1.2.4
