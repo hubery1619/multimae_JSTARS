@@ -395,8 +395,6 @@ class EfficientMaskedAutoencoderGroupChannelViT(nn.Module):
         # reorder the channels of predicted tensor
         pred_reordered = torch.index_select(pred, 1, inverse_order_tensor)
         target = self.patchify(imgs, self.patch_embed[0].patch_size[0], self.in_c)  # (N, L, C*P*P)
-
-        
         b, _, _, _ = imgs.shape
         G = len(self.channel_groups)
         mask_partial = mask_partial.view(b, G, -1)

@@ -1,8 +1,4 @@
-export WANDB_API_KEY=086abda60b36b2a79c0fee558059ed21d96ced9b  # 替换为你刚刚复制的 API Key
-wandb login $WANDB_API_KEY
-
 python -m torch.distributed.launch --nproc_per_node=2 --use-env main_finetune_lora.py \
---wandb crossselfmae_fm_input_eurosat_finetune_lora_lastlayer_multi_lr \
 --batch_size 24 --accum_iter 16 --blr 0.0001 \
 --epochs 1 --num_workers 2 \
 --input_size 96 --patch_size 8  \

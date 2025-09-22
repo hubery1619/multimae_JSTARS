@@ -10,6 +10,8 @@ import os
 import time
 import wandb
 from pathlib import Path
+from tqdm import tqdm
+import torch.nn as nn
 
 
 import torch
@@ -22,8 +24,6 @@ assert timm.__version__ == "0.3.2"  # version check
 from timm.models.layers import trunc_normal_
 from timm.data.mixup import Mixup
 from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
-from util.lora import QkvWithLoRA
-from functools import partial
 
 import util.lr_decay as lrd
 import util.misc as misc
@@ -31,16 +31,49 @@ from util.datasets import build_fmow_dataset
 from util.pos_embed import interpolate_pos_embed
 from util.misc import NativeScalerWithGradNormCount as NativeScaler
 
-import models_resnet
 import models_vit
-import models_vit_temporal
-import models_vit_group_channels_lora
+import models_vit_group_channels_eval_freq
 
-from engine_finetune import (train_one_epoch, train_one_epoch_temporal,
-                             evaluate, evaluate_temporal)
+from engine_finetune import evaluate
 
-lora_rank = 32
-lora_alpha = 1.0
+import torch.nn.functional as F 
+from einops import rearrange, reduce, repeat
+import matplotlib.pyplot as plt
+from timm.utils import AverageMeter
+import math
+
+
+def fourier(x):
+    """2D Fourier transform"""
+    f = torch.fft.fft2(x)
+    f = f.abs() + 1e-6
+    f = f.log()
+    return f
+
+def shift(x):  
+    """shift Fourier transformed feature map"""
+    b, c, h, w = x.shape
+    return torch.roll(x, shifts=(int(h/2), int(w/2)), dims=(2, 3))
+
+def get_fourier_latents(latents):
+    """Fourier transform feature maps"""
+    fourier_latents = []
+    for latent in latents:  # `latents` is a list of hidden feature maps in latent spaces
+        latent = latent.cpu()
+        b, n, c = latent.shape
+        h, w = int(math.sqrt(n)), int(math.sqrt(n))
+        latent = rearrange(latent, "b (h w) c -> b c h w", h=h, w=w)
+        
+        latent = fourier(latent)
+        latent = shift(latent).mean(dim=(0, 1))
+        latent = latent.diag()[int(h/2):]  # only use the half-diagonal components
+        latent = latent - latent[0]  # visualize 'relative' log amplitudes 
+                                     # (i.e., low-freq amp - high freq amp)
+        fourier_latents.append(latent)
+
+    return fourier_latents
+
+
 
 def get_args_parser():
     parser = argparse.ArgumentParser('MAE fine-tuning for image classification', add_help=False)
@@ -51,8 +84,7 @@ def get_args_parser():
                         help='Accumulate gradient iterations (for increasing the effective batch size under memory constraints)')
 
     # Model parameters
-    parser.add_argument('--model_type', default=None, choices=['group_c', 'resnet', 'resnet_pre',
-                                                               'temporal', 'vanilla'],
+    parser.add_argument('--model_type', default=None, choices=['group_c', 'vanilla'],
                         help='Use channel model')
     parser.add_argument('--model', default='vit_large_patch16', type=str, metavar='MODEL',
                         help='Name of model to train')
@@ -131,7 +163,7 @@ def get_args_parser():
                         help='Train .csv path')
     parser.add_argument('--test_path', default='/home/val_62classes.csv', type=str,
                         help='Test .csv path')
-    parser.add_argument('--dataset_type', default='rgb', choices=['rgb', 'temporal', 'sentinel', 'euro_sat', 'naip'],
+    parser.add_argument('--dataset_type', default='rgb', choices=['rgb', 'sentinel', 'euro_sat'],
                         help='Whether to use fmow rgb, sentinel, or other dataset.')
     parser.add_argument('--masked_bands', default=None, nargs='+', type=int,
                         help='Sequence of band indices to mask (with mean val) in sentinel dataset')
@@ -177,12 +209,6 @@ def get_args_parser():
                         help='url used to set up distributed training')
 
     return parser
-
-
-# def freeze_except_lora(model):
-#     for name, param in model.named_parameters():
-#         if 'lora' not in name:
-#             param.requires_grad = False  # Freezing all parameters except those specific to LoRA
 
 
 def main(args):
@@ -261,19 +287,10 @@ def main(args):
         if len(args.grouped_bands) == 0:
             args.grouped_bands = [[0, 1, 2, 6], [3, 4, 5, 7], [8, 9]]
         print(f"Grouping bands {args.grouped_bands}")
-        model = models_vit_group_channels_lora.__dict__[args.model](
+        model = models_vit_group_channels_eval_freq.__dict__[args.model](
             patch_size=args.patch_size, img_size=args.input_size, in_chans=dataset_train.in_c,
             channel_groups=args.grouped_bands,
             num_classes=args.nb_classes, drop_path_rate=args.drop_path, global_pool=args.global_pool,
-        )
-    elif args.model_type == 'resnet' or args.model_type == 'resnet_pre':
-        pre_trained = args.model_type == 'resnet_pre'
-        model = models_resnet.__dict__[args.model](in_c=dataset_train.in_c, pretrained=pre_trained)
-    elif args.model_type == 'temporal':
-        model = models_vit_temporal.__dict__[args.model](
-            num_classes=args.nb_classes,
-            drop_path_rate=args.drop_path,
-            global_pool=args.global_pool,
         )
     else:
         model = models_vit.__dict__[args.model](
@@ -318,26 +335,6 @@ def main(args):
 
         # manually initialize fc layer
         trunc_normal_(model.head.weight, std=2e-5)
-
-        # Add LoRA adapters to self-attention blocks (query, value)
-        assign_lora = partial(QkvWithLoRA, rank=lora_rank, alpha=lora_alpha)
-        for block in model.blocks:
-            block.attn.qkv = assign_lora(block.attn.qkv)
-
-        # Freeze all params
-        for param in model.parameters():
-            param.requires_grad = False
-
-        # Unfreeze LoRA layers
-        for block in model.blocks:
-            for param in block.attn.qkv.lora_q.parameters():
-                param.requires_grad = True
-            for param in block.attn.qkv.lora_v.parameters():
-                param.requires_grad = True
-
-        # Unfreeze classifier layer
-        for param in model.head.parameters():
-            param.requires_grad = True
 
     model.to(device)
 
@@ -391,77 +388,36 @@ def main(args):
         wandb.watch(model)
 
     if args.eval:
-        if args.model_type == 'temporal':
-            test_stats = evaluate_temporal(data_loader_val, model, device)
-        else:
-            test_stats = evaluate(data_loader_val, model, device)
+        test_stats = evaluate(data_loader_val, model, device)
         print(f"Evaluation on {len(dataset_val)} test images- acc1: {test_stats['acc1']:.2f}%, "
               f"acc5: {test_stats['acc5']:.2f}%")
         exit(0)
 
-    print(f"Start training for {args.epochs} epochs")
-    start_time = time.time()
-    max_accuracy = 0.0
-    for epoch in range(args.start_epoch, args.epochs):
-        if args.distributed:
-            data_loader_train.sampler.set_epoch(epoch)
 
-        if args.model_type == 'temporal':
-            train_stats = train_one_epoch_temporal(
-                model, criterion, data_loader_train,
-                optimizer, device, epoch, loss_scaler,
-                args.clip_grad, mixup_fn,
-                log_writer=log_writer,
-                args=args
-            )
-        else:
-            train_stats = train_one_epoch(
-                model, criterion, data_loader_train,
-                optimizer, device, epoch, loss_scaler,
-                args.clip_grad, mixup_fn,
-                log_writer=log_writer,
-                args=args
-            )
+    fourier_latents = AverageMeter()
+    for i, (xs, ys) in enumerate(data_loader_train):
+        with torch.no_grad():
+            xs = xs.cuda()
+            _, zs, _, _ = model(xs)
+            zs = zs[:-1]
 
-        if args.output_dir and (epoch % args.save_every == 0 or epoch + 1 == args.epochs):
-            misc.save_model(
-                args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
-                loss_scaler=loss_scaler, epoch=epoch)
+        latents = [rearrange(z[:, 1:, :], "b (h w g) l -> (b g) (h w) l", h=12, w=12, g=3) for z in zs]
+        _fourier_latents = torch.stack(get_fourier_latents(latents))
+        fourier_latents.update(_fourier_latents)
 
-        if args.model_type == 'temporal':
-            test_stats = evaluate_temporal(data_loader_val, model, device)
-        else:
-            test_stats = evaluate(data_loader_val, model, device)
-
-        print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
-        max_accuracy = max(max_accuracy, test_stats["acc1"])
-        print(f'Max accuracy: {max_accuracy:.2f}%')
-
-        if log_writer is not None:
-            log_writer.add_scalar('perf/test_acc1', test_stats['acc1'], epoch)
-            log_writer.add_scalar('perf/test_acc5', test_stats['acc5'], epoch)
-            log_writer.add_scalar('perf/test_loss', test_stats['loss'], epoch)
-
-        log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                     **{f'test_{k}': v for k, v in test_stats.items()},
-                     'epoch': epoch,
-                     'n_parameters': n_parameters}
-
-        if args.output_dir and misc.is_main_process():
-            if log_writer is not None:
-                log_writer.flush()
-            with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
-                f.write(json.dumps(log_stats) + "\n")
+        if i > -1:
+            break
             
-            if args.wandb is not None:
-                try:
-                    wandb.log(log_stats)
-                except ValueError:
-                    print(f"Invalid stats?")
-
-    total_time = time.time() - start_time
-    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print('Training time {}'.format(total_time_str))
+    fig, ax = plt.subplots(1, 1, figsize=(4.2, 4), dpi=150)
+    fourier_latents = fourier_latents.avg
+    with open('self_attention_fourier.txt', 'w') as f:
+        for fourier_latent in fourier_latents[:,-1][::2]:
+            f.write(f"{fourier_latent}\n")
+    ax.plot(range(24), fourier_latents[:,-1][::2], marker="o")
+    ax.set_xlabel("Depth")
+    ax.set_ylabel("$\Delta$ Log amplitude")
+    # ax.set_ylim(top=-1.5, bottom=-3.5)
+    plt.savefig('fourier_proposed.png', dpi=150)  
 
 
 if __name__ == '__main__':

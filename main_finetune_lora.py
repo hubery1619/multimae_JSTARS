@@ -8,7 +8,6 @@ import json
 import numpy as np
 import os
 import time
-import wandb
 from pathlib import Path
 
 
@@ -31,13 +30,10 @@ from util.datasets import build_fmow_dataset
 from util.pos_embed import interpolate_pos_embed
 from util.misc import NativeScalerWithGradNormCount as NativeScaler
 
-import models_resnet
 import models_vit
-import models_vit_temporal
 import models_vit_group_channels_lora
 
-from engine_finetune import (train_one_epoch, train_one_epoch_temporal,
-                             evaluate, evaluate_temporal)
+from engine_finetune_eurosat import (train_one_epoch, evaluate)
 
 lora_rank = 32
 lora_alpha = 1.0
@@ -51,8 +47,7 @@ def get_args_parser():
                         help='Accumulate gradient iterations (for increasing the effective batch size under memory constraints)')
 
     # Model parameters
-    parser.add_argument('--model_type', default=None, choices=['group_c', 'resnet', 'resnet_pre',
-                                                               'temporal', 'vanilla'],
+    parser.add_argument('--model_type', default=None, choices=['group_c', 'vanilla'],
                         help='Use channel model')
     parser.add_argument('--model', default='vit_large_patch16', type=str, metavar='MODEL',
                         help='Name of model to train')
@@ -131,7 +126,7 @@ def get_args_parser():
                         help='Train .csv path')
     parser.add_argument('--test_path', default='/home/val_62classes.csv', type=str,
                         help='Test .csv path')
-    parser.add_argument('--dataset_type', default='rgb', choices=['rgb', 'temporal', 'sentinel', 'euro_sat', 'naip'],
+    parser.add_argument('--dataset_type', default='rgb', choices=['rgb', 'sentinel', 'euro_sat'],
                         help='Whether to use fmow rgb, sentinel, or other dataset.')
     parser.add_argument('--masked_bands', default=None, nargs='+', type=int,
                         help='Sequence of band indices to mask (with mean val) in sentinel dataset')
@@ -177,12 +172,6 @@ def get_args_parser():
                         help='url used to set up distributed training')
 
     return parser
-
-
-# def freeze_except_lora(model):
-#     for name, param in model.named_parameters():
-#         if 'lora' not in name:
-#             param.requires_grad = False  # Freezing all parameters except those specific to LoRA
 
 
 def main(args):
@@ -265,15 +254,6 @@ def main(args):
             patch_size=args.patch_size, img_size=args.input_size, in_chans=dataset_train.in_c,
             channel_groups=args.grouped_bands,
             num_classes=args.nb_classes, drop_path_rate=args.drop_path, global_pool=args.global_pool,
-        )
-    elif args.model_type == 'resnet' or args.model_type == 'resnet_pre':
-        pre_trained = args.model_type == 'resnet_pre'
-        model = models_resnet.__dict__[args.model](in_c=dataset_train.in_c, pretrained=pre_trained)
-    elif args.model_type == 'temporal':
-        model = models_vit_temporal.__dict__[args.model](
-            num_classes=args.nb_classes,
-            drop_path_rate=args.drop_path,
-            global_pool=args.global_pool,
         )
     else:
         model = models_vit.__dict__[args.model](
@@ -422,17 +402,14 @@ def main(args):
 
     misc.load_model(args=args, model_without_ddp=model_without_ddp, optimizer=optimizer, loss_scaler=loss_scaler)
 
-    # Set up wandb
-    if global_rank == 0 and args.wandb is not None:
-        wandb.init(project=args.wandb, entity="huberyliu") # entity="mae-sentinel"
-        wandb.config.update(args)
-        wandb.watch(model)
+    # # Set up wandb
+    # if global_rank == 0 and args.wandb is not None:
+    #     wandb.init(project=args.wandb, entity="huberyliu") # entity="mae-sentinel"
+    #     wandb.config.update(args)
+    #     wandb.watch(model)
 
     if args.eval:
-        if args.model_type == 'temporal':
-            test_stats = evaluate_temporal(data_loader_val, model, device)
-        else:
-            test_stats = evaluate(data_loader_val, model, device)
+        test_stats = evaluate(data_loader_val, model, device)
         print(f"Evaluation on {len(dataset_val)} test images- acc1: {test_stats['acc1']:.2f}%, "
               f"acc5: {test_stats['acc5']:.2f}%")
         exit(0)
@@ -443,33 +420,19 @@ def main(args):
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
-
-        if args.model_type == 'temporal':
-            train_stats = train_one_epoch_temporal(
-                model, criterion, data_loader_train,
-                optimizer, device, epoch, loss_scaler,
-                args.clip_grad, mixup_fn,
-                log_writer=log_writer,
-                args=args
-            )
-        else:
-            train_stats = train_one_epoch(
-                model, criterion, data_loader_train,
-                optimizer, device, epoch, loss_scaler,
-                args.clip_grad, mixup_fn,
-                log_writer=log_writer,
-                args=args
-            )
+        train_stats = train_one_epoch(
+            model, criterion, data_loader_train,
+            optimizer, device, epoch, loss_scaler,
+            args.clip_grad, mixup_fn,
+            log_writer=log_writer,
+            args=args
+        )
 
         if args.output_dir and (epoch % args.save_every == 0 or epoch + 1 == args.epochs):
             misc.save_model(
                 args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
                 loss_scaler=loss_scaler, epoch=epoch)
-
-        if args.model_type == 'temporal':
-            test_stats = evaluate_temporal(data_loader_val, model, device)
-        else:
-            test_stats = evaluate(data_loader_val, model, device)
+        test_stats = evaluate(data_loader_val, model, device)
 
         print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
         max_accuracy = max(max_accuracy, test_stats["acc1"])

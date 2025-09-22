@@ -10,7 +10,6 @@ import os
 import time
 import wandb
 from pathlib import Path
-from tqdm import tqdm
 import torch.nn as nn
 
 
@@ -31,16 +30,12 @@ from util.datasets import build_fmow_dataset
 from util.pos_embed import interpolate_pos_embed
 from util.misc import NativeScalerWithGradNormCount as NativeScaler
 
-import models_resnet
 import models_vit
-import models_vit_temporal
-import models_vit_group_channels
+import models_vit_group_channels_eval_attn
 
-from engine_finetune import (train_one_epoch, train_one_epoch_temporal,
-                             evaluate, evaluate_temporal)
+from engine_finetune import evaluate
 
 import torch.nn.functional as F 
-from einops import rearrange, reduce, repeat
 import matplotlib.pyplot as plt
 from timm.utils import AverageMeter
 
@@ -52,7 +47,6 @@ num_groups = 3  # 3 groups
 
 
 def compute_distance_matrix(patch_size, patches_per_side, num_groups):
-    """计算具有多组的距离矩阵，组间相同索引的补丁距离为0."""
     num_patches_per_group = patches_per_side ** 2
     total_patches = num_patches_per_group * num_groups
     distance_matrix = np.zeros((total_patches, total_patches))
@@ -70,10 +64,8 @@ def compute_distance_matrix(patch_size, patches_per_side, num_groups):
 
 
 def calculate_mean_attention_dist(patch_size, attention_weights, patches_per_side, num_groups):
-    """计算组织补丁的平均注意力距离，忽略组间距离."""
-    num_patches = attention_weights.shape[-1]  # 应为432
+    num_patches = attention_weights.shape[-1]  
 
-    # 计算距离矩阵
     distance_matrix = compute_distance_matrix(patch_size, patches_per_side, num_groups)
     h, w = distance_matrix.shape
 
@@ -95,8 +87,7 @@ def get_args_parser():
                         help='Accumulate gradient iterations (for increasing the effective batch size under memory constraints)')
 
     # Model parameters
-    parser.add_argument('--model_type', default=None, choices=['group_c', 'resnet', 'resnet_pre',
-                                                               'temporal', 'vanilla'],
+    parser.add_argument('--model_type', default=None, choices=['group_c', 'vanilla'],
                         help='Use channel model')
     parser.add_argument('--model', default='vit_large_patch16', type=str, metavar='MODEL',
                         help='Name of model to train')
@@ -175,7 +166,7 @@ def get_args_parser():
                         help='Train .csv path')
     parser.add_argument('--test_path', default='/home/val_62classes.csv', type=str,
                         help='Test .csv path')
-    parser.add_argument('--dataset_type', default='rgb', choices=['rgb', 'temporal', 'sentinel', 'euro_sat', 'naip'],
+    parser.add_argument('--dataset_type', default='rgb', choices=['rgb', 'sentinel', 'euro_sat'],
                         help='Whether to use fmow rgb, sentinel, or other dataset.')
     parser.add_argument('--masked_bands', default=None, nargs='+', type=int,
                         help='Sequence of band indices to mask (with mean val) in sentinel dataset')
@@ -299,19 +290,10 @@ def main(args):
         if len(args.grouped_bands) == 0:
             args.grouped_bands = [[0, 1, 2, 6], [3, 4, 5, 7], [8, 9]]
         print(f"Grouping bands {args.grouped_bands}")
-        model = models_vit_group_channels.__dict__[args.model](
+        model = models_vit_group_channels_eval_attn.__dict__[args.model](
             patch_size=args.patch_size, img_size=args.input_size, in_chans=dataset_train.in_c,
             channel_groups=args.grouped_bands,
             num_classes=args.nb_classes, drop_path_rate=args.drop_path, global_pool=args.global_pool,
-        )
-    elif args.model_type == 'resnet' or args.model_type == 'resnet_pre':
-        pre_trained = args.model_type == 'resnet_pre'
-        model = models_resnet.__dict__[args.model](in_c=dataset_train.in_c, pretrained=pre_trained)
-    elif args.model_type == 'temporal':
-        model = models_vit_temporal.__dict__[args.model](
-            num_classes=args.nb_classes,
-            drop_path_rate=args.drop_path,
-            global_pool=args.global_pool,
         )
     else:
         model = models_vit.__dict__[args.model](
@@ -409,10 +391,7 @@ def main(args):
         wandb.watch(model)
 
     if args.eval:
-        if args.model_type == 'temporal':
-            test_stats = evaluate_temporal(data_loader_val, model, device)
-        else:
-            test_stats = evaluate(data_loader_val, model, device)
+        test_stats = evaluate(data_loader_val, model, device)
         print(f"Evaluation on {len(dataset_val)} test images- acc1: {test_stats['acc1']:.2f}%, "
               f"acc5: {test_stats['acc5']:.2f}%")
         exit(0)
@@ -442,7 +421,6 @@ def main(args):
     fig, ax = plt.subplots(1, 1, figsize=(4.3, 4), dpi=150)
     distances = [torch.mean(distance.avg) for distance in distances]
 
-    # 将数据写入到文本文件
     with open('crossattention_distances.txt', 'w') as f:
         for distance in distances:
             f.write(f"{distance}\n")
@@ -451,7 +429,7 @@ def main(args):
     ax.set_xlabel("Depth")
     ax.set_ylabel("Attention distance (px)")
     ax.set_ylim(top=max(distances), bottom=0)
-    plt.savefig('attention_distance_crossattentionbaselineinputfm_1batch.png', dpi=150)  # 可以调整dpi以改变输出图像的质量
+    plt.savefig('attention_distance_crossattentionbaselineinputfm_1batch.png', dpi=150)  
 
 
 

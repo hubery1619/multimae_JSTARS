@@ -1,4 +1,4 @@
-python -m torch.distributed.launch --nproc_per_node=2 --use-env main_eva_norm_MI.py \
+python -m torch.distributed.launch --nproc_per_node=2 --use-env main_eva_freq.py \
 --batch_size 30 --accum_iter 16 --blr 0.0002 \
 --epochs 1 --num_workers 2 \
 --input_size 96 --patch_size 8  \
@@ -9,4 +9,4 @@ python -m torch.distributed.launch --nproc_per_node=2 --use-env main_eva_norm_MI
 --test_path ./dataset/fmow-sentinel/val_updated.csv \
 --output_dir ./experiments/finetune \
 --log_dir ./experiments/finetune \
---finetune ./checkpoint/selfattentionbaseline/checkpoint-49.pth \
+--finetune ./checkpoint/crossmaeinputfm/checkpoint-49.pth \
