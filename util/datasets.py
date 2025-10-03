@@ -4,6 +4,7 @@ import numpy as np
 import warnings
 import random
 from glob import glob
+import json
 
 from typing import Any, Optional, List
 
@@ -13,6 +14,9 @@ from torchvision import transforms
 from PIL import Image
 import rasterio
 from rasterio import logging
+
+from pathlib import Path
+import skimage.io as io
 
 log = logging.getLogger()
 log.setLevel(logging.ERROR)
@@ -38,6 +42,52 @@ CATEGORIES = ["airport", "airport_hangar", "airport_terminal", "amusement_park",
               "tower", "tunnel_opening", "waste_disposal", "water_treatment_facility",
               "wind_farm", "zoo"]
 
+NEW_LABELS = [
+    'Urban fabric',
+    'Industrial or commercial units',
+    'Arable land',
+    'Permanent crops',
+    'Pastures',
+    'Complex cultivation patterns',
+    'Land principally occupied by agriculture, with significant areas of natural vegetation',
+    'Agro-forestry areas',
+    'Broad-leaved forest',
+    'Coniferous forest',
+    'Mixed forest',
+    'Natural grassland and sparsely vegetated areas',
+    'Moors, heathland and sclerophyllous vegetation',
+    'Transitional woodland/shrub',
+    'Beaches, dunes, sands',
+    'Inland wetlands',
+    'Coastal wetlands',
+    'Inland waters',
+    'Marine waters'
+]
+
+GROUP_LABELS = {
+    'Continuous urban fabric': 'Urban fabric',
+    'Discontinuous urban fabric': 'Urban fabric',
+    'Non-irrigated arable land': 'Arable land',
+    'Permanently irrigated land': 'Arable land',
+    'Rice fields': 'Arable land',
+    'Vineyards': 'Permanent crops',
+    'Fruit trees and berry plantations': 'Permanent crops',
+    'Olive groves': 'Permanent crops',
+    'Annual crops associated with permanent crops': 'Permanent crops',
+    'Natural grassland': 'Natural grassland and sparsely vegetated areas',
+    'Sparsely vegetated areas': 'Natural grassland and sparsely vegetated areas',
+    'Moors and heathland': 'Moors, heathland and sclerophyllous vegetation',
+    'Sclerophyllous vegetation': 'Moors, heathland and sclerophyllous vegetation',
+    'Inland marshes': 'Inland wetlands',
+    'Peatbogs': 'Inland wetlands',
+    'Salt marshes': 'Coastal wetlands',
+    'Salines': 'Coastal wetlands',
+    'Water bodies': 'Inland waters',
+    'Water courses': 'Inland waters',
+    'Coastal lagoons': 'Marine waters',
+    'Estuaries': 'Marine waters',
+    'Sea and ocean': 'Marine waters'
+}
 
 class SatelliteDataset(Dataset):
     """
@@ -493,6 +543,151 @@ class SentinelIndividualImageDataset(SatelliteDataset):
 
         return transforms.Compose(t)
 
+def get_multihot_new(labels):
+        target = np.zeros((len(NEW_LABELS),), dtype=np.float32)
+        for label in labels:
+            if label in GROUP_LABELS:
+                target[NEW_LABELS.index(GROUP_LABELS[label])] = 1
+            elif label not in set(NEW_LABELS):
+                continue
+            else:
+                target[NEW_LABELS.index(label)] = 1
+        # target = target.reshape(1,19)
+        return target
+
+class BigEarthNetFinetuneDataset(SatelliteDataset):
+    label_types = ['value', 'one-hot']
+    mean = [1370.19151926, 1184.3824625 , 1120.77120066, 1136.26026392,
+            1263.73947144, 1645.40315151, 1846.87040806, 1762.59530783,
+            1972.62420416,  582.72633433,  1732.16362238, 1247.91870117]
+    std = [633.15169573,  650.2842772 ,  712.12507725,  965.23119807,
+           948.9819932 , 1108.06650639, 1258.36394548, 1233.1492281 ,
+           1364.38688993,  472.37967789,   1310.36996126, 1087.6020813]
+
+    # mean = [752.40087073, 884.29673756, 1144.16202635, 1297.47289228, 1624.90992062, 2194.6423161, 2422.21248945,
+    #         2517.76053101, 2581.64687018, 2645.51888987, 2368.51236873, 1805.06846033]
+    #
+    # std = [1108.02887453, 1155.15170768, 1183.6292542, 1368.11351514, 1370.265037, 1355.55390699, 1416.51487101,
+    #        1474.78900051, 1439.3086061, 1582.28010962, 1455.52084939, 1343.48379601]
+
+    def __init__(self,
+                 csv_path: str,
+                 transform: Any,
+                 #years: Optional[List[int]] = [*range(2000, 2021)],
+                 label_type: str = 'value',
+                 masked_bands: Optional[List[int]] = None,
+                 dropped_bands: Optional[List[int]] = None):
+        """
+        Creates dataset for multi-spectral single image classification.
+        Usually used for fMoW-Sentinel dataset.
+        :csv_path: the txt file loads basic information of dataset
+        :param transform: pytorch Transform for transforms and tensor conversion
+        :param years: List of years to take images from, None to not filter
+        :param masked_bands: List of indices corresponding to which bands to mask out
+        :param dropped_bands:  List of indices corresponding to which bands to drop from input image tensor
+        """
+        super().__init__(in_c=12)
+        # Filter by category
+        # self.categories = CATEGORIES
+        # if categories is not None:
+        #     self.categories = categories
+        #     self.df = self.df.loc[categories]
+        # self.indices = self.df.index.unique().to_numpy()
+
+        self.transform = transform
+        self.get_multihot_new = get_multihot_new
+        self.masked_bands = masked_bands
+        self.dropped_bands = dropped_bands
+        if self.dropped_bands is not None:
+            self.in_c = self.in_c - len(dropped_bands)
+        self.image_root = Path('dataset/bigearthnet')
+
+        self.samples = []
+        #self.labels_sample=[]
+        with open(csv_path) as f:
+            for patch_id in f.read().splitlines():
+                #self.samples.append(self.image_root + patch_id + '/' + patch_id + '.tif')
+                self.samples.append(self.image_root / patch_id)
+                #self.labels_sample.append(self.label_root/patch_id)
+                #print(self.samples)
+
+    def __len__(self):
+        return len(self.samples)
+
+    def open_image(self, img_path):
+        # with rasterio.open(img_path) as data:
+        #     img = data.read()  # (c, h, w)
+
+        img = io.imread(img_path)
+        # kid = (img - img.min(axis=(0, 1), keepdims=True))
+        # mom = (img.max(axis=(0, 1), keepdims=True) - img.min(axis=(0, 1), keepdims=True))
+        # img = kid / (mom + 1e-10)
+
+        return img.astype(np.float32)
+
+        # return img.transpose(1, 2, 0).astype(np.float32)  # (h, w, c)
+
+    def __getitem__(self, index):
+        """
+        Gets image (x,y) pair given index in dataset.
+        :param idx: Index of (image, label) pair in dataset dataframe. (c, h, w)
+        :return: Torch Tensor image, and integer label as a tuple.
+        """
+        path = self.samples[index]  
+        patch_id = path.name #S2A_MSIL2A_20180527T093041_25_79
+        
+        images = self.open_image(path  / f'{patch_id}.tif')
+
+        if self.masked_bands is not None:
+            images[:, :, self.masked_bands] = np.array(self.mean)[self.masked_bands]
+        
+        with open(  path / f'{patch_id}_labels_metadata.json', 'r') as f:
+            labels = json.load(f)['labels']
+        targets = self.get_multihot_new(labels)
+        # print(targets.shape)
+        # targets.transpose(0,1)
+        
+        img_as_tensor = self.transform(images)  # (c, h, w)
+
+        if self.dropped_bands is not None:
+            keep_idxs = [i for i in range(img_as_tensor.shape[0]) if i not in self.dropped_bands]
+            img_as_tensor = img_as_tensor[keep_idxs, :, :]
+
+        sample = {
+            'images': images,
+            'labels': targets,
+        }
+        return img_as_tensor, targets
+    @staticmethod
+    def build_transform(is_train, input_size, mean, std):
+        # train transform
+        interpol_mode = transforms.InterpolationMode.BICUBIC
+
+        t = []
+        if is_train:
+            t.append(SentinelNormalize(mean, std))  # use specific Sentinel normalization to avoid NaN
+            t.append(transforms.ToTensor())
+            t.append(
+                transforms.RandomResizedCrop(input_size, scale=(0.2, 1.0), interpolation=interpol_mode),  # 3 is bicubic
+            )
+            t.append(transforms.RandomHorizontalFlip())
+            return transforms.Compose(t)
+
+        # eval transform
+        if input_size <= 224:
+            crop_pct = 224 / 256
+        else:
+            crop_pct = 1.0
+        size = int(input_size / crop_pct)
+
+        t.append(SentinelNormalize(mean, std))
+        t.append(transforms.ToTensor())
+        t.append(
+            transforms.Resize(size, interpolation=interpol_mode),  # to maintain same ratio w.r.t. 224 images
+        )
+        t.append(transforms.CenterCrop(input_size))
+
+        return transforms.Compose(t)
 
 class EuroSat(SatelliteDataset):
     mean = [1370.19151926, 1184.3824625, 1120.77120066, 1136.26026392,
@@ -583,6 +778,12 @@ def build_fmow_dataset(is_train: bool, args) -> SatelliteDataset:
         from util.naip_loader import NAIP_train_dataset, NAIP_test_dataset, NAIP_CLASS_NUM
         dataset = NAIP_train_dataset if is_train else NAIP_test_dataset
         args.nb_classes = NAIP_CLASS_NUM
+    elif args.dataset_type == 'bigearthnet_finetune':
+        mean = BigEarthNetFinetuneDataset.mean
+        std = BigEarthNetFinetuneDataset.std
+        transform =BigEarthNetFinetuneDataset.build_transform(is_train, args.input_size, mean, std)
+        dataset = BigEarthNetFinetuneDataset(csv_path, transform, masked_bands=args.masked_bands,
+                                                 dropped_bands=args.dropped_bands)
     else:
         raise ValueError(f"Invalid dataset type: {args.dataset_type}")
     print(dataset)
